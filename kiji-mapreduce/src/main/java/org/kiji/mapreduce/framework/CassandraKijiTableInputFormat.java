@@ -41,10 +41,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * InputFormat for Hadoop MapReduce jobs reading from a Cassandra-backed Kiji table.
@@ -109,7 +106,7 @@ public final class CassandraKijiTableInputFormat
     CassandraAdmin admin = cassandraKiji.getCassandraAdmin();
 
     // TODO: Remove this hardcoding, use KijiManagedCassandraTableName instead.
-    String keyspace = "kiji_" + kiji.toString();
+    String keyspace = "kiji_" + inputTableURI.getInstance();
     String columnFamily = "table_" + inputTableURI.getTable();
     ConfigHelper.setInputColumnFamily(conf, keyspace, columnFamily);
 
@@ -241,6 +238,7 @@ public final class CassandraKijiTableInputFormat
     /** {@inheritDoc} */
     @Override
     public void initialize(InputSplit split, TaskAttemptContext context) throws IOException {
+      LOG.info("Creating Cassandra table record reader...");
       mRecordReader.initialize(split, context);
     }
 
@@ -273,15 +271,57 @@ public final class CassandraKijiTableInputFormat
         mCurrentRow = null;
         return false;
       }
-      Row row = mRecordReader.getCurrentValue();
-      assert(null != row);
 
-      // Figure out the entity ID from the row.
-      ByteBuffer currentEntityIdBlob = row.getBytes(CassandraKiji.CASSANDRA_KEY_COL);
-      byte[] eidBytes = CassandraByteUtil.byteBuffertoBytes(currentEntityIdBlob);
-      EntityId eid = mEntityIdFactory.getEntityIdFromHBaseRowKey(eidBytes);
+      // -------------------------------------------------------------------------------------------
+      // Keep reading more Rows from the record reader until the entity IDs no longer match, or
+      // until the record reader runs out of rows.
+      // (i.e., until you get to data for the next Kiji row)
+      // TODO: Unit test the heck out of this code!
 
-      mCurrentRow = mReader.getRowDataFromCassandraRow(mDataRequest, row);
+      HashSet<Row> cassandraRowsForThisKijiRow = new HashSet<Row>();
+      EntityId entityIdForThisKijiRow = null;
+
+      LOG.info("Creating a new Kiji row!");
+
+      while (true) {
+        Row cassandraRow = mRecordReader.getCurrentValue();
+        Preconditions.checkNotNull(cassandraRow);
+        assert(null != cassandraRow);
+
+        // Figure out the entity ID from the cassandraRow.
+        ByteBuffer currentEntityIdBlob = cassandraRow.getBytes(CassandraKiji.CASSANDRA_KEY_COL);
+        byte[] eidBytes = CassandraByteUtil.byteBuffertoBytes(currentEntityIdBlob);
+        EntityId eid = mEntityIdFactory.getEntityIdFromHBaseRowKey(eidBytes);
+
+        if (null == entityIdForThisKijiRow || eid == entityIdForThisKijiRow) {
+          LOG.info("Adding another C* row to the Kiji row.");
+          // If this is a cassandraRow for the current Kiji cassandraRow we are processing, then add this to our list.
+          cassandraRowsForThisKijiRow.add(cassandraRow);
+          entityIdForThisKijiRow = eid;
+        } else {
+          // We are done with rows for this entity ID!
+          LOG.info("Got a different entity Id, ending this row.");
+          break;
+        }
+
+        assert(entityIdForThisKijiRow == eid);
+
+        // Break the loop if this is the last value left.
+        if (!mRecordReader.nextKeyValue()) {
+          LOG.info("No more values left in backing Cassandra / Hadoop record reader, ending this row.");
+          break;
+        }
+      }
+
+      // We should have gotten at least one row for a given entity ID.
+      assert(cassandraRowsForThisKijiRow.size() >= 1);
+      assert(entityIdForThisKijiRow != null);
+
+      LOG.info(String.format(
+          "Updating the current Kiji row after reading %d Cassandra Rows.",
+          cassandraRowsForThisKijiRow.size()
+      ));
+      mCurrentRow = mReader.getRowDataFromCassandraRows(mDataRequest, entityIdForThisKijiRow, cassandraRowsForThisKijiRow);
       return true;
     }
 
